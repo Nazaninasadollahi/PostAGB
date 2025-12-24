@@ -1,116 +1,165 @@
+
 from astropy.io import fits
 from astropy.time import Time
 from astropy.coordinates import SkyCoord, EarthLocation
 import astropy.units as u
+
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
-# =========================
-# 1. LOAD AND CORRECT SPECTRUM
-# =========================
+# =====================================================
+# 1. LOAD SPECTRUM
+# =====================================================
 file_path = "ADP.2020-06-26T11:14:16.096.fits"
 
-wave = None
-flux = None
-
 with fits.open(file_path) as hdul:
+    wave_red = None
+    flux_red = None
+
     for hdu in hdul:
-        if isinstance(hdu, fits.BinTableHDU) and {'WAVE', 'FLUX'} <= set(hdu.columns.names):
-            wave_red = np.array(hdu.data['WAVE'][0], dtype=float)
-            flux_red = np.array(hdu.data['FLUX'][0], dtype=float)
-            print(f"Found RED spectrum in HDU '{hdu.name}' (extension {hdul.index_of(hdu)})")
-            break
+        if isinstance(hdu, fits.BinTableHDU):
+            if {'WAVE', 'FLUX'} <= set(hdu.columns.names):
+                wave_red = np.array(hdu.data['WAVE'][0], dtype=float)
+                flux_red = np.array(hdu.data['FLUX'][0], dtype=float)
+                print(f"Found spectrum in HDU {hdul.index_of(hdu)}")
+                break
 
 if wave_red is None or flux_red is None:
-    raise RuntimeError("Could not find WAVE and FLUX columns in the red FITS file.")
+    raise RuntimeError("WAVE / FLUX columns not found")
 
-#normalization
-z = np.polyfit(wave_red, flux_red, 1)  # 3rd-degree is much more stable
+# =====================================================
+# 2. CONTINUUM NORMALIZATION
+# =====================================================
+z = np.polyfit(wave_red, flux_red, 1)
 p = np.poly1d(z)
-cnt = p(wave_red)
-flux_normalized = flux_red / cnt
-flux_red = flux_normalized - 0.12
+continuum = p(wave_red)
 
-# Extract observation parameters
+flux_norm = flux_red / continuum
+flux_norm -= 0.12  # your offset
+
+# =====================================================
+# 3. OBSERVATION PARAMETERS
+# =====================================================
 def extract_observation_params(filepath):
     with fits.open(filepath) as hdul:
         lat = lon = elev = None
-        date_obs = ra_deg = dec_deg = frame = None
+        date_obs = ra = dec = frame = None
+
         for hdu in hdul:
             hdr = hdu.header
             if lat is None and 'ESO TEL GEOLAT' in hdr: lat = hdr['ESO TEL GEOLAT']
             if lon is None and 'ESO TEL GEOLON' in hdr: lon = hdr['ESO TEL GEOLON']
             if elev is None and 'ESO TEL GEOELEV' in hdr: elev = hdr['ESO TEL GEOELEV']
             if date_obs is None and 'DATE-OBS' in hdr: date_obs = hdr['DATE-OBS']
-            if ra_deg is None and 'RA' in hdr: ra_deg = hdr['RA']
-            if dec_deg is None and 'DEC' in hdr: dec_deg = hdr['DEC']
+            if ra is None and 'RA' in hdr: ra = hdr['RA']
+            if dec is None and 'DEC' in hdr: dec = hdr['DEC']
             if frame is None and 'RADECSYS' in hdr: frame = hdr['RADECSYS']
-        return lat, lon, elev, date_obs, ra_deg, dec_deg, frame
 
-lat_r, lon_r, elev_r, date_obs_r, ra_r, dec_r, frame_r = extract_observation_params(file_path)
+        return lat, lon, elev, date_obs, ra, dec, frame
 
-target_coord = SkyCoord(ra=ra_r * u.deg, dec=dec_r * u.deg, frame=frame_r.lower())
-obs_time = Time(date_obs_r, scale='utc')
-obs_location = EarthLocation(lat=lat_r * u.deg, lon=lon_r * u.deg, height=elev_r * u.m)
+lat, lon, elev, date_obs, ra, dec, frame = extract_observation_params(file_path)
 
-v_heliocentric = target_coord.radial_velocity_correction(
-    kind='heliocentric', obstime=obs_time, location=obs_location
-).to(u.km / u.s).value
+target = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame=frame.lower())
+obs_time = Time(date_obs, scale='utc')
+obs_loc = EarthLocation(lat=lat*u.deg, lon=lon*u.deg, height=elev*u.m)
+
+# =====================================================
+# 4. HELIOCENTRIC + ISM CORRECTION
+# =====================================================
+v_helio = target.radial_velocity_correction(
+    kind='heliocentric',
+    obstime=obs_time,
+    location=obs_loc
+).to(u.km/u.s).value
 
 c = 299792.458  # km/s
-wave_heliocentric = wave_red * (1.0 + v_heliocentric / c)
 
-# ISM correction for BD+33 2642
+wave_helio = wave_red * (1.0 + v_helio / c)
+
+# ISM correction (BD+33 2642)
 v_ism = -20.37  # km/s
-wave_ism = wave_heliocentric * (1.0 - v_ism / c)
+wave_ism = wave_helio * (1.0 - v_ism / c)
 
-# =========================
-# 2. ZOOM REGION: ±15 Å around 4259.01 Å
-# =========================
-lambda_0 = 4259.01
-zoom_width = 5.0  # Å
+# =====================================================
+# 5. READ LINE LIST (CSV)
+# =====================================================
+# CSV columns must be: lambda0, FWHM, EW_base
+line_table = pd.read_csv("line_list.csv")
 
-mask = (wave_ism >= lambda_0 - zoom_width) & (wave_ism <= lambda_0 + zoom_width)
-wave_zoom = wave_ism[mask]
-flux_zoom = flux_red[mask]
+# =====================================================
+# 6. GAUSSIAN ABSORPTION FUNCTION
+# =====================================================
+def gaussian_absorption(wave, lambda0, FWHM, EW):
+    sigma = FWHM / (2 * np.sqrt(2 * np.log(2)))
+    A = EW / (np.sqrt(2 * np.pi) * sigma)
+    return 1.0 - A * np.exp(-(wave - lambda0)**2 / (2 * sigma**2))
 
-# =========================
-# 3. GAUSSIAN ABSORPTION PROFILES (2008 and 2009 scaled)
-# =========================
-FWHM = 1.05    # Å (instrumental + intrinsic broadening)
-EW_base = 0.0215  # Å (your reference EW)
+# =====================================================
+# 7. SLIDING 30 Å WINDOWS
+# =====================================================
+window_width = 30.0
+half_window = window_width / 2
 
-# Scaled EWs according to your factors
-EW_2008 = EW_base * 0.06 / 1.11
-EW_2009 = EW_base * 0.06 / 1.27
+wave_min = wave_ism.min()
+wave_max = wave_ism.max()
 
-sigma = FWHM / (2 * np.sqrt(2 * np.log(2)))
-A_2008 = EW_2008 / (np.sqrt(2 * np.pi) * sigma)
-A_2009 = EW_2009 / (np.sqrt(2 * np.pi) * sigma)
+window_centers = np.arange(
+    wave_min + half_window,
+    wave_max - half_window,
+    window_width
+)
 
-# Wavelength grid for smooth Gaussian
-wave_gauss = np.linspace(lambda_0 - zoom_width, lambda_0 + zoom_width, 1000)
-gauss_2008 = 1.0 - A_2008 * np.exp(-(wave_gauss - lambda_0)**2 / (2 * sigma**2))
-gauss_2009 = 1.0 - A_2009 * np.exp(-(wave_gauss - lambda_0)**2 / (2 * sigma**2))
+# =====================================================
+# 8. LOOP OVER WINDOWS AND LINES
+# =====================================================
+for center in window_centers:
 
-# =========================
-# 4. PLOT: DATA + MODELS
-# =========================
-plt.figure(figsize=(10, 6))
+    mask = (wave_ism >= center - half_window) & (wave_ism <= center + half_window)
+    wave_zoom = wave_ism[mask]
+    flux_zoom = flux_norm[mask]
 
-# Plot observed spectrum (normalized)
-plt.plot(wave_zoom, flux_zoom, color='black', linewidth=1.2, label='Observed (ISM frame)')
+    if len(wave_zoom) < 20:
+        continue
 
-# Plot Gaussian models
-plt.plot(wave_gauss, gauss_2008, color='blue', linewidth=2, label='Model 2008 (scaled EW)')
-plt.plot(wave_gauss, gauss_2009, color='red', linewidth=2, label='Model 2009 (scaled EW)')
+    plt.figure(figsize=(10, 5))
+    plt.plot(wave_zoom, flux_zoom, color='black', lw=1.2, label='Observed')
 
-# Aesthetics
-plt.axvline(lambda_0, color='gray', linestyle='--', alpha=0.7, label=f'λ₀ = {lambda_0} Å')
-plt.xlabel('Wavelength (Å)', fontsize=12)
-plt.ylabel('Flux', fontsize=12)
-plt.title('Zoom around 4259.01 Å (±15 Å) with Gaussian Absorption Models', fontsize=13)
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.show()
+    # ---------------------------------
+    # loop over all lines in CSV
+    # ---------------------------------
+    for _, row in line_table.iterrows():
+
+        lambda0 = row['lambda0']
+        FWHM = row['FWHM']
+        EW_base = row['EW_base']
+
+        if not (center - half_window <= lambda0 <= center + half_window):
+            continue
+
+        # your scaling
+        EW_2008 = EW_base * 0.06 / 1.11
+        EW_2009 = EW_base * 0.06 / 1.27
+
+        wave_model = np.linspace(center - half_window,
+                                 center + half_window,
+                                 1000)
+
+        model_2008 = gaussian_absorption(wave_model, lambda0, FWHM, EW_2008)
+        model_2009 = gaussian_absorption(wave_model, lambda0, FWHM, EW_2009)
+
+        label_2008 = f'2008 λ={lambda0:.2f}' if EW_base != 0 else '_nolegend_'
+        label_2009 = f'2009 λ={lambda0:.2f}' if EW_base != 0 else '_nolegend_'
+
+        plt.plot(wave_model, model_2008, '--', lw=2, label=label_2008)
+        plt.plot(wave_model, model_2009, ':', lw=2, label=label_2009)
+
+        plt.axvline(lambda0, color='blue', ls='--', alpha=0.6)
+
+    plt.xlabel("Wavelength (Å)")
+    plt.ylabel("Flux")
+    plt.title(f"{center-half_window:.1f} – {center+half_window:.1f} Å")
+    plt.grid(alpha=0.3)
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    plt.show()
