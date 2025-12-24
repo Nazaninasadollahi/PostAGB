@@ -137,7 +137,7 @@ for center in window_centers:
         if not (center - half_window <= lambda0 <= center + half_window):
             continue
 
-        # your scaling
+        # Scaling for BD332642 star
         EW_2008 = EW_base * 0.06 / 1.11
         EW_2009 = EW_base * 0.06 / 1.27
 
